@@ -1,0 +1,23 @@
+# 登录态 ＝ 账号权限，绝不入库
+data/
+*.cookies.json
+bili_cookies.json
+cookies.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 打包产物
+dist/
+*.mfp
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
