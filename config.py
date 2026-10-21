@@ -76,6 +76,14 @@ class BiliWhaleConfig(BaseConfig):
         )
         allow_like: bool = Field(default=True, description="允许点赞 / 取消点赞（可逆）")
         allow_fav: bool = Field(default=True, description="允许收藏 / 取消收藏（可逆）")
+        allow_follow: bool = Field(
+            default=True,
+            description=(
+                "允许关注 / 取关 UP 主。\n"
+                "关注会通知对方、留痕比较明显；这个插件挂在主人自己的号上，所以默认开，"
+                "仍受 [actions] enabled 总闸约束。装在别人实例上时建议关掉。"
+            ),
+        )
 
     @config_section("query", title="只读规模", tag="query")
     class QuerySection(SectionBase):
@@ -86,6 +94,62 @@ class BiliWhaleConfig(BaseConfig):
         order_todo_only: bool = Field(
             default=False,
             description="orders 默认只看未完成（方便直接盯待收货）",
+        )
+
+    @config_section("chat", title="私信自动巡查", tag="chat")
+    class ChatSection(SectionBase):
+        """自动查私信（默认关）。
+
+        节奏（主人定的）：
+
+        - 平时 **10 分钟**查一次会话列表；
+        - 一旦查到对方发来新私信，切到 **10 秒**一次的高频；
+        - 高频连着 **6 次**都没查到新消息（对方没再回复），退回 10 分钟一次。
+
+        查到的内容只写日志和缓存文件，不主动往聊天流里推——需要时用
+        ``bili_query action=chat`` 去读。
+        """
+
+        enabled: bool = Field(
+            default=False,
+            description=(
+                "是否开启后台自动查私信。\n"
+                "默认关：它会在后台按节奏请求 B 站接口（虽轻，但没必要人人开）。"
+            ),
+        )
+        idle_interval: int = Field(
+            default=600,
+            description="平时多久查一次（秒，默认 600 = 10 分钟）",
+        )
+        burst_interval: int = Field(
+            default=10,
+            description="查到新私信后多久查一次（秒，默认 10 秒）",
+        )
+        burst_checks: int = Field(
+            default=6,
+            description=(
+                "高频阶段连续多少次没查到新消息就退回低频（默认 6）。\n"
+                "这期间又收到对方新消息会重新计数，继续高频。"
+            ),
+        )
+        tick_seconds: float = Field(
+            default=10.0,
+            description=(
+                "后台节拍（秒）：调度器按这个间隔唤醒，由内部状态机决定这一拍要不要真的请求。\n"
+                "**不要小于 burst_interval**，否则高频做不到那么密。默认 10。"
+            ),
+        )
+        feed_file: str = Field(
+            default="data/bili_whale/chat_feed.json",
+            description="新私信缓存文件（相对框架根目录）",
+        )
+        feed_keep: int = Field(
+            default=60,
+            description="缓存文件最多留多少条新私信（多了丢最旧的）",
+        )
+        max_sessions: int = Field(
+            default=20,
+            description="每次巡查拉多少个会话（B 站一页最多 20 上下，太多也没意义）",
         )
 
     @config_section("watch", title="看视频", tag="watch")
@@ -148,6 +212,7 @@ class BiliWhaleConfig(BaseConfig):
     plugin: PluginSection = Field(default_factory=PluginSection)
     actions: ActionsSection = Field(default_factory=ActionsSection)
     query: QuerySection = Field(default_factory=QuerySection)
+    chat: ChatSection = Field(default_factory=ChatSection)
     watch: WatchSection = Field(default_factory=WatchSection)
 
 

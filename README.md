@@ -1,19 +1,23 @@
 # bili_whale —— B站账号管家（深深专用）
 
-让她像主人一样用 B 站：查账号、看视频弹幕、翻会员购订单、替主人发评论发弹幕。
+让她像主人一样用 B 站：查账号、读私信、看视频弹幕、翻会员购订单、搜人并关注 UP 主、替主人发评论发弹幕。
 
-作者：**Aemeath**　｜　适用：Neo-MoFox ≥ 1.2.0
+作者：**Aemeath**　｜　适用：Neo-MoFox ≥ 1.2.0　｜　当前版本：1.1.0
 
 ---
 
 ## 它解决什么问题
 
-主人的 B 站账号里有真信息：未读消息、会员购订单（哪单要到仓库补尾款、快递单号、
-收货地址）、收藏夹、观看历史。这些原本只有主人自己能在 App 里翻。
+主人的 B 站账号里有真信息：未读消息、私信往来、会员购订单（哪单要到仓库补尾款、
+快递单号、收货地址）、收藏夹、观看历史。这些原本只有主人自己能在 App 里翻。
 
 这个插件把这些能力交给 bot，**方式很轻**：登录态只读一份 `cookies.json`
 （从 Playwright 一次性导出的完整 cookie，含 httpOnly 的 SESSDATA），之后全部走
 纯 HTTP + wbi 签名 —— 不常驻浏览器、不占 MCP 调用、一条查询两百 token 上下。
+
+1.1.0 新加两块：**读私信 + 后台自动巡查**（默认关，10 分钟一次；一有新私信转 10 秒
+高频，连续 6 次没回复就退回 10 分钟），以及**搜 UP 主 / 关注**（多个候选会停下来问
+请求者，不自己挑）。
 
 顺带给了她一个很好用的副产物：**用弹幕看懂视频**。B 站字幕不是每个视频都有
 （实测很多视频 `subtitles: []`），但弹幕永远有——按时间轴铺开之后，观众在吐槽什么、
@@ -219,13 +223,97 @@ allow_danmaku = false   # 弹幕删不掉，建议按需
 | 工具 | 作用 |
 |---|---|
 | `bili_catalog` | 能力目录：每件事该调哪个工具、哪个 action、target 填什么。不确定就先查它 |
-| `bili_query` | 只读：`account` / `unread` / `orders` / `order` / `video` / `danmaku` / `history` / `favs` / `followings` |
+| `bili_query` | 只读：`account` / `unread` / `chat` / `search_user` / `relation` / `orders` / `order` / `video` / `danmaku` / `history` / `favs` / `followings` |
 | `bili_watch` | **看视频**：链接进去 → 信息 + 弹幕 + 抽帧画面 |
-| `bili_action` | 写：`reply` / `danmaku` / `like` / `unlike` / `fav_add` / `fav_del` |
+| `bili_action` | 写：`reply` / `danmaku` / `like` / `unlike` / `fav_add` / `fav_del` / `follow` / `unfollow` |
 
 为什么只给四个：B 站能做的事有二十来件，一件一个工具会把工具面撑爆（`tool_hub`
 实测过 88 个工具占掉 53% 输入）。这里按「目录 / 只读 / 看视频 / 写」折成四个入口，
 具体动作走 `action` 参数——schema 小、命中缓存、模型也好记。
+
+## 私信（`bili_query action=chat`）
+
+旧版只能看到「私信 3 条未读」这个数字，看不到谁发的、说了什么。1.1.0 起接上了
+私信接口（`api.vc.bilibili.com` 的会话列表 + 消息接口，Referer 走 `message.bilibili.com`）：
+
+```
+bili_query  action=chat                       → 会话列表：
+  私信会话 17 个（另有 4 个系统通知会话，不算私信）：
+  · 某某（talker_id=1234567）10-21 08:23 对方：在吗，想问下…
+bili_query  action=chat  target=1234567       → 这一段对话最近的消息
+```
+
+两个细节：
+
+- **会话列表本身不带普通用户的昵称**（`last_msg.account_info` 是空的，只有系统号才
+  有名字），所以会额外批量查一次 `account/v1/user/cards` 补上名字——一次请求，不是
+  一个个查；
+- **系统通知会话**（`system_msg_type` 非 0，talker_id 是 8.4e14 那种大数）一律排除，
+  那不是「谁给你发私信」。
+
+### 自动巡查（`[chat] enabled`，默认关）
+
+打开之后后台会按这套节奏自己查：
+
+```
+平时 ──每 10 分钟查一次──▶ 发现对方新私信
+                              │
+                              ▼
+                         每 10 秒查一次（最多 6 次）
+                              │
+              ┌───────────────┴───────────────┐
+       这 6 次里又收到新消息            连着 6 次没新消息
+              │                               │
+              ▼                               ▼
+        重新计数、继续高频               退回每 10 分钟一次
+```
+
+- 「新私信」的判据是会话最后一条消息的时间戳；**最后一条是自己发的**不算新私信
+  ——那是在等对方回；
+- 首次巡查只建基线，不会把历史会话全当新消息刷一遍；
+- 查到的内容**只记日志 + 写缓存文件**，不主动往聊天流推。要看用
+  `bili_query action=chat`（里面会带上「最近缓存到的新私信」）；
+- 缓存文件默认 `data/bili_whale/chat_feed.json`，最多留 60 条。
+
+配置项（`config/plugins/bili_whale/config.toml`）：
+
+```toml
+[chat]
+enabled = false          # 默认关
+idle_interval = 600      # 10 分钟
+burst_interval = 10      # 收到新私信后的高频间隔
+burst_checks = 6         # 连续 6 次没新消息就退回低频
+tick_seconds = 10.0      # 后台节拍（由状态机决定这一拍要不要真请求）
+feed_file = "data/bili_whale/chat_feed.json"
+feed_keep = 60
+max_sessions = 20
+```
+
+> 巡查任务是注册到框架 `UnifiedScheduler` 的（`bili_whale_chat_watch`），插件卸载/
+> 重载会自己摘掉，不会留后台任务。
+
+## 关注 UP 主（`bili_action action=follow`）
+
+```
+bili_query  action=search_user  target=关键词    → 候选：mid / 昵称 / 粉丝 / 投稿 / 认证 / 签名
+bili_query  action=relation     target=mid       → 已关注 / 互关 / 未关注 / 拉黑
+bili_action action=follow       target=mid 或空间链接或名字
+bili_action action=unfollow     target=mid 或空间链接或名字
+```
+
+**挑选的规矩是按主人要求做死的**：给名字时先搜一遍——
+
+- 昵称和关键词**完全一样**且只有一个 → 直接关注它；
+- 有多个同名 / 只有近似匹配 → **一个都不动**，返回候选列表，让模型去问请求者是哪一位；
+- 一个都没搜到 → 明说没搜到，不瞎关注。
+
+给 mid 或 `space.bilibili.com/123456` 链接则直接动（会先查关系状态：已经关注过就
+不重复关注、没关注的就别提取关）。
+
+关注接口不需要 wbi 签名，csrf（cookie 里的 `bili_jct`）就够；重复关注返回 `22014`
+按幂等处理，不当错误。开关是 `[actions] allow_follow`（默认开，跟其他写操作一致，
+仍受 `[actions] enabled` 总闸管）。
+
 
 ## 看视频（`bili_watch`）
 
@@ -335,23 +423,26 @@ B 站对无头有检测，无头跑容易触发风控。所以这里起的是**�
 
 认不出来会明确说「认不出这是哪个视频」，不会瞎猜。
 
-## 三个工具
-
 ## 自检
 
 用实例自带 venv（别用系统 python）：
 
 ```powershell
 $env:NEO_ROOT="F:\Neo-MoFox-Aemeath"
-
-# 1) 导入冒烟：证明框架能加载
 & "F:\Neo-MoFox-Aemeath\.venv\Scripts\python.exe" tests\check_import.py
 
-# 2) 端到端：真装一遍、真查一次（只读，写操作只验证被拦）
+# 端到端：真装一遍、真查一次（只读，写操作只验证被拦）
 & "F:\Neo-MoFox-Aemeath\.venv\Scripts\python.exe" tests\check_logic.py
+
+# 私信巡查状态机（纯离线，不联网、不碰账号）
+& "F:\Neo-MoFox-Aemeath\.venv\Scripts\python.exe" tests\check_watch.py
 ```
 
-两个脚本都按「失败项计数 → exit 1」收尾，方便进 CI。
+三个脚本都按「失败项计数 → exit 1」收尾，方便进 CI。
+
+`check_watch.py` 用**可注入时钟**把「10 分钟 / 10 秒」压成秒级来跑：首次基线、到点
+才请求、转高频、6 次回退、高频期间来消息重置计数、「我发的」不算新私信、新会话算
+新私信、缓存落盘与条数上限，全部有断言。
 
 ## 实测踩过的坑（别再踩回去）
 

@@ -147,6 +147,79 @@ async def main() -> None:
     except Exception as exc:  # noqa: BLE001
         check("查收藏夹", False, f"{type(exc).__name__}: {exc}")
 
+    # ---------------------------------------------------------- 3.5 私信 / UP 主
+    try:
+        ok, text = await query.execute("chat")
+        check(
+            "查私信会话列表",
+            ok and ("私信会话" in text or "没有会话" in text),
+            text.split("\n")[0][:70],
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("查私信会话列表", False, f"{type(exc).__name__}: {exc}")
+
+    try:
+        ok, text = await query.execute("chat", "12076317", 5)
+        check(
+            "读某段私信",
+            ok and ("最近" in text or "没有聊天记录" in text),
+            text.split("\n")[0][:70],
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("读某段私信", False, f"{type(exc).__name__}: {exc}")
+
+    try:
+        ok, text = await query.execute("search_user", "深深", 3)
+        check("搜 UP 主", ok and "mid=" in text, text.split("\n")[0][:70])
+    except Exception as exc:  # noqa: BLE001
+        check("搜 UP 主", False, f"{type(exc).__name__}: {exc}")
+
+    try:
+        ok, text = await query.execute("relation", "12076317")
+        check("查关注状态", ok and ("关注" in text or "状态" in text), text.split("\n")[0][:50])
+    except Exception as exc:  # noqa: BLE001
+        check("查关注状态", False, f"{type(exc).__name__}: {exc}")
+
+    # mid 解析（纯函数，不联网）
+    mid_cases = [
+        ("123456", 123456),
+        ("space.bilibili.com/98765", 98765),
+        ("https://space.bilibili.com/456?spm=1", 456),
+        ("深深", None),
+        ("", None),
+    ]
+    for raw, expect in mid_cases:
+        got = BiliActionTool._parse_mid(raw)
+        check(f"解析 mid {raw or '（空）'}", got == expect, f"{got}（期望 {expect}）")
+
+    # ---------------------------------------------------------- 3.6 关注闸门（不真关注）
+    saved_switch = plugin.config.actions.allow_follow
+    try:
+        plugin.config.actions.allow_follow = False
+        ok, text = await action.execute("follow", "123")
+        check("关掉 allow_follow 时拒绝关注", (not ok) and "allow_follow" in text, text[:50])
+    except Exception as exc:  # noqa: BLE001
+        check("关注开关闸门", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        plugin.config.actions.allow_follow = saved_switch
+
+    try:
+        ok, text = await action.execute("follow", "")
+        check("关注空目标被拦", (not ok) and "指定目标" in text, text[:50])
+    except Exception as exc:  # noqa: BLE001
+        check("关注空目标", False, f"{type(exc).__name__}: {exc}")
+
+    try:
+        # 搜一个几乎不可能存在的名字：要么搜不到、要么给候选让人确认——两种都不该真关注
+        ok, text = await action.execute("follow", "zz不存在的up主名字zz")
+        check(
+            "模糊名字不会瞎关注（要么搜不到，要么列候选）",
+            (not ok) and ("没搜到" in text or "先确认" in text),
+            text.split("\n")[0][:60],
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("模糊名字保护", False, f"{type(exc).__name__}: {exc}")
+
     # ---------------------------------------------------------- 4. 写闸门
     # 默认是开的（主人的号），但空内容必须在发出去之前就被拦下
     try:

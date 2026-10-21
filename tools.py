@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from typing import Annotated, Any
 
 from src.app.plugin_system.base import BaseTool
@@ -44,6 +46,32 @@ async def _run(func, *args, **kwargs) -> dict[str, Any]:
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+def _when(stamp: Any) -> str:
+    """时间戳 → ``10-21 08:23``（拿不到就给问号，别让格式化把查询打断）。"""
+
+    try:
+        value = int(stamp)
+    except (TypeError, ValueError):
+        return "?"
+    if value <= 0:
+        return "?"
+    return time.strftime("%m-%d %H:%M", time.localtime(value))
+
+
+def _human_count(value: Any) -> str:
+    """粉丝数这种大数字折成「4.2万 / 1.2亿」，省 token 也好读。"""
+
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "?"
+    if number >= 100_000_000:
+        return f"{number / 100_000_000:.1f}亿"
+    if number >= 10_000:
+        return f"{number / 10_000:.1f}万"
+    return str(number)
+
+
 # --------------------------------------------------------------------- 只读
 
 
@@ -55,6 +83,11 @@ class BiliQueryTool(BaseTool):
         "查询主人在 B 站上的信息，只读。用 action 选查什么：\n"
         "- account：账号概况（昵称/等级/硬币/大会员）；\n"
         "- unread：未读消息计数（点赞、回复、@、私信、弹幕、系统通知）；\n"
+        "- chat：私信。不填 target ＝ 最近的会话列表（带 talker_id 和最后一条摘要，"
+        "以及自动巡查缓存到的新私信）；target 填 talker_id ＝ 看那段对话最近的消息；\n"
+        "- search_user：搜 UP 主，target 填名字/关键词，返回候选（mid、粉丝、投稿、认证、签名）。"
+        "**搜到多个别自己挑，先问请求者要哪一个**；\n"
+        "- relation：和某个 UP 主的关系（是否已关注/互关），target 填 mid；\n"
         "- orders：会员购订单列表（target 写 todo 就只看未完成的）；\n"
         "- order：单个订单详情，target 填订单号（例：「8001220220438018」）——"
         "会给商品、实付、定金尾款与截止、快递单号、收货信息、当前可做的操作；\n"
@@ -69,9 +102,14 @@ class BiliQueryTool(BaseTool):
 
     async def execute(
         self,
-        action: Annotated[str, "要查什么：account/unread/orders/order/video/danmaku/history/favs/followings"],
-        target: Annotated[str, "目标：BV 号、订单号、todo（orders 专用）；不需要就留空"] = "",
-        limit: Annotated[int, "条数或页码，0 表示用插件配置的默认值"] = 0,
+        action: Annotated[
+            str,
+            "要查什么：account/unread/chat/search_user/relation/orders/order/video/danmaku/history/favs/followings",
+        ],
+        target: Annotated[
+            str, "目标：BV 号、订单号、talker_id、搜索关键词、UP 主 mid、todo（orders 专用）；不需要就留空"
+        ] = "",
+        limit: Annotated[int, "条数、页码或候选数，0 表示用插件配置的默认值"] = 0,
     ) -> tuple[bool, str]:
         """执行一次只读查询。"""
 
@@ -203,15 +241,132 @@ class BiliQueryTool(BaseTool):
                 names = "、".join(x["昵称"] for x in data["本页"][:20])
                 return True, f"关注 {data['关注总数']} 人，第 {page} 页：{names}。{RECEIPT_HINT}"
 
+            if act == "chat":
+                return await self._chat(client, arg, limit)
+
+            if act in ("search_user", "search_up", "up"):
+                if not arg:
+                    return False, "搜 UP 主要给关键词（target 填名字，比如「某UP主」）。"
+                count = max(1, min(int(limit) or 8, 20))
+                data = await _run(client.search_users, arg, 1, count)
+                rows = (data.get("候选") or [])[:count]
+                if not rows:
+                    return True, f"搜「{arg}」没搜到用户。{RECEIPT_HINT}"
+                lines = [f"搜「{arg}」共 {data.get('总数') or '?'} 个用户，前 {len(rows)} 位："]
+                for index, row in enumerate(rows, 1):
+                    lines.append(
+                        f"{index}. {row['昵称']}（mid={row['mid']}，粉丝 {_human_count(row['粉丝'])}，"
+                        f"投稿 {row['投稿']}，Lv{row['等级']}）"
+                    )
+                    detail = []
+                    if row.get("认证"):
+                        detail.append(f"认证：{row['认证']}")
+                    if row.get("签名"):
+                        detail.append(f"签名：{row['签名']}")
+                    if detail:
+                        lines.append("   " + "｜".join(detail))
+                lines.append(
+                    "要关注就把 mid 交给 bili_action action=follow；"
+                    "**候选不止一个像的，先把列表给请求者问清是哪一位，别自己挑**。"
+                )
+                return True, "\n".join(lines) + RECEIPT_HINT
+
+            if act == "relation":
+                if not arg.isdigit():
+                    return False, "查关注状态要给 mid（纯数字）。"
+                data = await _run(client.relation, int(arg))
+                names = {}
+                try:
+                    names = await _run(client.chat_peer_names, [int(arg)])
+                except BiliError:
+                    names = {}
+                who = names.get(int(arg)) or f"mid={arg}"
+                extra = "（互相关注）" if data["互关"] else ""
+                return True, f"{who}：{data['状态']}{extra}。{RECEIPT_HINT}"
+
             return False, (
-                f"不认识的查询类型：{action!r}。可选：account / unread / orders / order / "
-                "video / danmaku / history / favs / followings。"
+                f"不认识的查询类型：{action!r}。可选：account / unread / chat / search_user / "
+                "relation / orders / order / video / danmaku / history / favs / followings。"
             )
 
         except BiliError as exc:
             return False, f"查询失败：{exc}"
         except Exception as exc:  # noqa: BLE001 - 兜底不让工具炸掉整轮
             return False, f"查询异常（{type(exc).__name__}）：{exc}"
+
+    async def _chat(self, client, arg: str, limit: int) -> tuple[bool, str]:
+        """私信：不带 target 给会话列表，带 talker_id 读那段对话。"""
+
+        if arg:
+            if not arg.isdigit():
+                return False, (
+                    "看某段对话要填 talker_id（纯数字）。不知道就先用 action=chat 不带 target，"
+                    "从列表里拿 talker_id。"
+                )
+            talker = int(arg)
+            data = await _run(client.chat_messages, talker, max(3, min(int(limit) or 10, 30)))
+            messages = data["消息"]
+            if not messages:
+                return True, f"和 talker_id={talker} 之间没有聊天记录。{RECEIPT_HINT}"
+            names: dict[int, str] = {}
+            try:
+                names = await _run(client.chat_peer_names, [talker])
+            except BiliError:
+                names = {}
+            who = names.get(talker) or f"uid{talker}"
+            lines = [f"和「{who}」（talker_id={talker}）最近 {len(messages)} 条："]
+            for msg in messages:
+                lines.append(f"[{msg['时间']}] {'我' if msg['我'] else '对方'}：{msg['文本']}")
+            return True, "\n".join(lines) + RECEIPT_HINT
+
+        payload = await _run(client.chat_sessions, max(5, min(int(limit) or 20, 30)))
+        sessions = payload["会话"]
+        human = [item for item in sessions if not item["系统"]]
+        system_count = len(sessions) - len(human)
+        lines: list[str] = []
+        if human:
+            need = [item["talker_id"] for item in human if not item["昵称"] and item["talker_id"] > 0]
+            names = {}
+            if need:
+                try:
+                    names = await _run(client.chat_peer_names, need)
+                except BiliError:
+                    names = {}
+            lines.append(f"私信会话 {len(human)} 个（另有 {system_count} 个系统通知会话，不算私信）：")
+            for item in human[:12]:
+                who = names.get(item["talker_id"]) or item["昵称"] or f"uid{item['talker_id']}"
+                side = "我" if item["我发的"] else "对方"
+                unread = f"，未读 {item['unread']}" if item["unread"] else ""
+                lines.append(
+                    f"· {who}（talker_id={item['talker_id']}）{_when(item['last_ts'])} {side}："
+                    f"{(item['摘要'] or '（无文字）')[:60]}{unread}"
+                )
+            if len(human) > 12:
+                lines.append(f"…还有 {len(human) - 12} 个更早的会话没列。")
+            lines.append("要看某段对话：action=chat target=<talker_id>。")
+        else:
+            lines.append(f"私信里没有会话（系统通知会话 {system_count} 个已跳过）。")
+
+        watcher = runtime.get_watcher()
+        if watcher is not None:
+            state = watcher.state()
+            lines.append(
+                f"自动巡查：{state['模式']}，间隔 {state['间隔秒']}s，"
+                f"下次 {state['下次巡查秒']}s 后，已缓存 {state['缓存条数']} 条新私信。"
+            )
+            recent = watcher.recent(5)
+            if recent:
+                lines.append("最近缓存到的新私信：")
+                for entry in recent:
+                    lines.append(
+                        f"· [{entry.get('时间') or '?'}] {entry.get('对方') or '?'}："
+                        f"{str(entry.get('内容') or '')[:80]}"
+                    )
+        else:
+            lines.append(
+                "自动巡查没开（配置 [chat] enabled = false）——后台不盯，想看时直接查这个 action。"
+            )
+        return True, "\n".join(lines) + RECEIPT_HINT
 
 
 # --------------------------------------------------------------------- 写
@@ -228,15 +383,18 @@ class BiliActionTool(BaseTool):
         "- danmaku：发弹幕，target 填 BV 号、text 填内容，limit 可给秒数（默认第 5 秒）——"
         "弹幕发出去删不掉；\n"
         "- like / unlike：点赞 / 取消点赞，target 填 BV 号；\n"
-        "- fav_add / fav_del：收藏 / 取消收藏，target 填 BV 号、folder_id 填收藏夹 id（先用 favs 查）。\n"
-        "**动之前先跟主人确认**：这是他自己账号，评论和弹幕发出去就收不回。"
+        "- fav_add / fav_del：收藏 / 取消收藏，target 填 BV 号、folder_id 填收藏夹 id（先用 favs 查）；\n"
+        "- follow / unfollow：关注 / 取关 UP 主。target 可以是 mid（纯数字）、"
+        "空间链接（space.bilibili.com/123456）或 UP 主名字——给名字会先搜一遍："
+        "**搜到多个候选就停手把列表交回来问请求者，不会自己挑**。\n"
+        "**动之前先跟主人确认**：这是他自己账号，评论和弹幕发出去就收不回，关注还会通知对方。"
         "被拒绝时说明配置里对应开关没开，把拒绝理由如实告诉主人，别自己找绕路。"
     )
 
     async def execute(
         self,
-        action: Annotated[str, "写操作：reply/danmaku/like/unlike/fav_add/fav_del"],
-        target: Annotated[str, "BV 号"] = "",
+        action: Annotated[str, "写操作：reply/danmaku/like/unlike/fav_add/fav_del/follow/unfollow"],
+        target: Annotated[str, "BV 号；follow / unfollow 时填 mid、空间链接或 UP 主名字"] = "",
         text: Annotated[str, "评论或弹幕内容"] = "",
         folder_id: Annotated[str, "收藏夹 id（fav_add / fav_del 用）"] = "",
         limit: Annotated[int, "弹幕出现在第几秒，默认 5"] = 0,
@@ -250,7 +408,7 @@ class BiliActionTool(BaseTool):
         config = getattr(self, "plugin", None)
         cfg = getattr(config, "config", None)
         enabled = False
-        allow = {"reply": False, "danmaku": False, "like": True, "fav": True}
+        allow = {"reply": False, "danmaku": False, "like": True, "fav": True, "follow": True}
         try:
             if cfg is not None:
                 enabled = bool(cfg.actions.enabled)
@@ -259,6 +417,7 @@ class BiliActionTool(BaseTool):
                     "danmaku": bool(cfg.actions.allow_danmaku),
                     "like": bool(cfg.actions.allow_like),
                     "fav": bool(cfg.actions.allow_fav),
+                    "follow": bool(cfg.actions.allow_follow),
                 }
         except Exception:  # noqa: BLE001
             enabled = False
@@ -272,7 +431,7 @@ class BiliActionTool(BaseTool):
                 "[actions] enabled = false）。要动手得先让主人自己把总闸打开。"
             )
         if not bvid and act not in ("",):
-            return False, "写操作要指定目标 BV 号。"
+            return False, "写操作要指定目标（视频给 BV 号；关注给 mid、空间链接或 UP 主名字）。"
 
         try:
             if act == "reply":
@@ -307,14 +466,104 @@ class BiliActionTool(BaseTool):
                 data = await _run(client.fav, bvid, fid, act == "fav_add")
                 return True, f"{data['动作']}成功（{data['视频']}）。{RECEIPT_HINT}"
 
+            if act in ("follow", "unfollow"):
+                if not allow["follow"]:
+                    return False, "配置里没开「允许关注 / 取关」（actions.allow_follow = false）。"
+                return await self._follow(client, bvid, act == "follow")
+
             return False, (
-                f"不认识的写操作：{action!r}。可选：reply / danmaku / like / unlike / fav_add / fav_del。"
+                f"不认识的写操作：{action!r}。可选：reply / danmaku / like / unlike / "
+                "fav_add / fav_del / follow / unfollow。"
             )
 
         except BiliError as exc:
             return False, f"操作失败：{exc}"
         except Exception as exc:  # noqa: BLE001
             return False, f"操作异常（{type(exc).__name__}）：{exc}"
+
+    # --------------------------------------------------------- 关注 / 取关
+
+    _MID_PATTERN = re.compile(r"(?:space\.bilibili\.com/|m\.bilibili\.com/space/|mid[=:：]\s*)(\d+)")
+
+    @classmethod
+    def _parse_mid(cls, text: str) -> int | None:
+        """从 mid 或空间链接里抠出数字 mid；抠不到返回 None（当名字处理）。"""
+
+        value = (text or "").strip()
+        if not value:
+            return None
+        if value.isdigit():
+            return int(value)
+        match = cls._MID_PATTERN.search(value)
+        if match:
+            return int(match.group(1))
+        return None
+
+    async def _follow(self, client, target: str, on: bool) -> tuple[bool, str]:
+        """关注 / 取关。
+
+        主人定的规矩：**能挑出唯一符合的才动手，多个候选就把列表交回去问请求者**。
+        所以给名字时只信「唯一精确匹配」：
+        - 昵称和关键词完全一样的只有一个 → 直接关注它；
+        - 有多个同名 / 只有近似匹配 → 一个都不动，返回候选让模型去问人。
+        """
+
+        verb = "关注" if on else "取关"
+        mid = self._parse_mid(target)
+        note = ""
+
+        if mid is None:
+            keyword = (target or "").strip()
+            if not keyword:
+                return False, f"{verb}要给我 mid、空间链接或 UP 主名字。"
+            data = await _run(client.search_users, keyword, 1, 10)
+            rows = data.get("候选") or []
+            if not rows:
+                return False, f"搜「{keyword}」没搜到人，没有{verb}任何账号。"
+            exact = [row for row in rows if row["昵称"] == keyword]
+            pool = exact or rows
+            if len(pool) != 1:
+                lines = [
+                    f"搜「{keyword}」找到 {len(rows)} 位能对上的，**我还没{verb}**，先确认是哪一位："
+                ]
+                for index, row in enumerate(pool[:8], 1):
+                    lines.append(
+                        f"{index}. {row['昵称']}（mid={row['mid']}，粉丝 {_human_count(row['粉丝'])}，"
+                        f"投稿 {row['投稿']}，Lv{row['等级']}）"
+                    )
+                    if row.get("认证"):
+                        lines.append(f"   认证：{row['认证']}")
+                    if row.get("签名"):
+                        lines.append(f"   签名：{row['签名']}")
+                lines.append(
+                    "把选定那位的 mid 再给我（或者先问请求者要哪一个）——名字不够唯一我不敢瞎关注。"
+                )
+                return False, "\n".join(lines)
+            mid = int(pool[0]["mid"])
+            note = f"（按名字搜到「{pool[0]['昵称']}」）"
+
+        status = await _run(client.relation, mid)
+        if on and status["关注了"]:
+            return True, (
+                f"mid={mid} 早就关注过了（当前状态：{status['状态']}），没有重复操作。{RECEIPT_HINT}"
+            )
+        if (not on) and (not status["关注了"]):
+            return True, (
+                f"mid={mid} 本来就没关注（状态：{status['状态']}），不用取关。{RECEIPT_HINT}"
+            )
+
+        data = await _run(client.follow, mid, on)
+        who = f"mid={mid}"
+        try:
+            names = await _run(client.chat_peer_names, [mid])
+            if names.get(mid):
+                who = f"「{names[mid]}」（mid={mid}）"
+        except BiliError:
+            pass
+
+        if data.get("已存在"):
+            return True, f"{who} 已经是目标状态（{data.get('提示') or '接口说重复了'}）。{RECEIPT_HINT}"
+        return True, f"已{verb} {who}{note}。{RECEIPT_HINT}"
 
 
 # --------------------------------------------------------------------- 看视频
@@ -422,6 +671,18 @@ CATALOG = """B站能力目录（按分类。调用方式 = 工具名 + action + 
   bili_query  action=favs                        收藏夹列表（带 id，收藏要用）
   bili_query  action=followings limit=页码        关注的人
 
+【私信】只读
+  bili_query  action=chat                        私信会话列表（带 talker_id、最后一条、未读）
+  bili_query  action=chat      target=talker_id  看那段对话最近的消息
+  配置 [chat] enabled = true 时后台还会自动巡查（平时 10 分钟、收到新私信转 10 秒），
+  查到的新私信会缓存起来，上面这个 action 能看到。
+
+【UP 主】
+  bili_query  action=search_user target=关键词    搜人：返回 mid / 粉丝 / 投稿 / 认证 / 签名
+  bili_query  action=relation  target=mid         和这个人是什么关系（是否已关注 / 互关）
+  bili_action action=follow|unfollow  target=mid 或空间链接或名字
+      关注 / 取关（写操作）。给名字会先搜，**多个候选就停手问请求者**，不自己挑。
+
 【视频】只读
   bili_query  action=video    target=BV号        标题 / UP / 时长 / 播放 / 三连数 / 简介
   bili_query  action=danmaku  target=BV号        弹幕按时间铺开 ← 看懂视频最省钱的方式
@@ -437,6 +698,7 @@ CATALOG = """B站能力目录（按分类。调用方式 = 工具名 + action + 
   bili_action action=danmaku  target=BV号 text=内容 limit=秒  发弹幕（删不掉）
   bili_action action=like|unlike  target=BV号                点赞 / 取消（可逆）
   bili_action action=fav_add|fav_del  target=BV号 folder_id=收藏夹id  收藏 / 取消（可逆）
+  bili_action action=follow|unfollow  target=mid/名字        关注 / 取关（会通知对方）
 
 查不到想做的事就说"这个插件没这块能力"，别硬猜 action。"""
 

@@ -17,13 +17,17 @@ playwright MCP（打开 B 站 → ``Network.getAllCookies`` → 写成 json）�
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BasePlugin, register_plugin
+from src.kernel.concurrency import get_task_manager
+from src.kernel.scheduler import TriggerType, get_unified_scheduler
 
 from . import runtime
+from .chat_watch import ChatWatcher
 from .client import BiliClient, BiliError, load_cookies
 from .config import BiliWhaleConfig
 from .tools import BiliActionTool, BiliCatalogTool, BiliQueryTool, BiliWatchTool
@@ -31,6 +35,9 @@ from .tools import BiliActionTool, BiliCatalogTool, BiliQueryTool, BiliWatchTool
 logger = get_logger("bili_whale")
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
+
+#: 调度器里的任务名（固定名字，重载时靠它覆盖/移除）
+_WATCH_TASK_NAME = "bili_whale_chat_watch"
 
 
 @register_plugin
@@ -46,8 +53,13 @@ class BiliWhalePlugin(BasePlugin):
         "所以依赖 MCP（没连上只提醒，不影响使用）；写操作默认开——这个插件就是给主人自己的号用的，"
         "装到别人的实例上把 [actions] enabled 关掉即可。"
     )
-    plugin_version: str = "1.0.0"
+    plugin_version: str = "1.1.0"
     configs: list[type] = [BiliWhaleConfig]
+
+    def __init__(self, config=None) -> None:
+        super().__init__(config)
+        self._watch_task_id: str | None = None
+        self._watch_schedule_id: str | None = None
 
     def get_components(self) -> list[type]:
         """配置里关掉就整体下线（一个工具都不注册）。"""
@@ -58,7 +70,7 @@ class BiliWhalePlugin(BasePlugin):
         return [BiliCatalogTool, BiliQueryTool, BiliActionTool, BiliWatchTool]
 
     async def on_plugin_loaded(self) -> None:
-        """装载登录态、提示 MCP 与写操作开关状态。"""
+        """装载登录态、按配置起私信巡查、提示 MCP 与写操作开关状态。"""
 
         config = self.config
         if not isinstance(config, BiliWhaleConfig):
@@ -67,6 +79,7 @@ class BiliWhalePlugin(BasePlugin):
 
         self._load_login(config)
         self._check_mcp(config)
+        self._start_chat_watch(config)
 
         if not config.actions.enabled:
             logger.info(
@@ -83,11 +96,14 @@ class BiliWhalePlugin(BasePlugin):
                 allowed.append("点赞")
             if config.actions.allow_fav:
                 allowed.append("收藏")
+            if config.actions.allow_follow:
+                allowed.append("关注")
             logger.info(f"bili_whale: 写操作已开，允许：{'、'.join(allowed) or '（无）'}")
 
     async def on_plugin_unloaded(self) -> None:
-        """清掉客户端单例（cookie 文件不动）。"""
+        """卸掉后台巡查任务、清掉客户端单例（cookie 文件不动）。"""
 
+        await self._stop_chat_watch()
         runtime.reset()
         logger.info("bili_whale: 已卸载")
 
@@ -117,12 +133,16 @@ class BiliWhalePlugin(BasePlugin):
 
         return _PLUGIN_DIR.parent.parent
 
-    def _cookie_path(self, config: BiliWhaleConfig) -> Path:
-        raw = (config.plugin.cookie_file or "").strip()
-        path = Path(raw).expanduser()
+    def _resolve(self, raw: str) -> Path:
+        """把配置里的相对路径按框架根目录解析（绝对路径原样用）。"""
+
+        path = Path(str(raw or "").strip()).expanduser()
         if not path.is_absolute():
             path = (self._framework_root() / path).resolve()
         return path
+
+    def _cookie_path(self, config: BiliWhaleConfig) -> Path:
+        return self._resolve(config.plugin.cookie_file)
 
     def _load_login(self, config: BiliWhaleConfig) -> None:
         path = self._cookie_path(config)
@@ -173,6 +193,127 @@ class BiliWhalePlugin(BasePlugin):
                 f"届时请在 config/mcp.toml 里启用 [mcp.stdio_servers.{target}]，"
                 f"打开 B 站后重新导出一份登录态。"
             )
+
+    # ------------------------------------------------------------ 私信巡查
+
+    def _start_chat_watch(self, config: BiliWhaleConfig) -> None:
+        """按配置起私信自动巡查（默认关；没有登录态就不起）。"""
+
+        chat = config.chat
+        if not chat.enabled:
+            logger.info(
+                "bili_whale: 自动查私信没开（[chat] enabled = false）——"
+                "后台不轮询，需要时用 bili_query action=chat 现查。"
+            )
+            return
+
+        client = runtime.get_client()
+        if client is None:
+            logger.warning(
+                "bili_whale: 自动查私信要登录态，但启动时没装载成功——巡查不启动。"
+            )
+            return
+
+        watcher = ChatWatcher(
+            client,
+            idle_interval=int(chat.idle_interval),
+            burst_interval=int(chat.burst_interval),
+            burst_checks=int(chat.burst_checks),
+            feed_path=self._resolve(chat.feed_file),
+            feed_keep=int(chat.feed_keep),
+            max_sessions=int(chat.max_sessions),
+        )
+        runtime.set_watcher(watcher)
+        logger.info(
+            f"bili_whale: 自动查私信已开——平时每 {watcher.idle}s 一次，"
+            f"收到新私信转 {watcher.burst}s、最多 {watcher.checks} 次"
+        )
+
+        try:
+            task_info = get_task_manager().create_task(
+                self._register_chat_watch(float(chat.tick_seconds)),
+                name="bili_whale_chat_watch_register",
+                daemon=True,
+            )
+            self._watch_task_id = task_info.task_id
+        except Exception as error:  # noqa: BLE001 - 注册失败不影响查询
+            logger.warning(f"bili_whale: 排队注册私信巡查失败：{error}")
+
+    async def _register_chat_watch(self, tick_seconds: float) -> None:
+        """等调度器就绪后注册巡查节拍。"""
+
+        interval = max(1.0, float(tick_seconds or 10.0))
+        try:
+            scheduler = get_unified_scheduler()
+        except Exception as error:  # noqa: BLE001 - 没有调度器就别注册
+            logger.warning(f"bili_whale: 调度器不可用，私信巡查没注册：{error}")
+            return
+
+        for _ in range(40):
+            try:
+                schedule_id = await scheduler.create_schedule(
+                    callback=self._chat_watch_tick,
+                    trigger_type=TriggerType.TIME,
+                    trigger_config={"interval_seconds": interval},
+                    is_recurring=True,
+                    task_name=_WATCH_TASK_NAME,
+                    force_overwrite=True,
+                )
+            except RuntimeError:
+                # 调度器还没 start()，等一下再试
+                await asyncio.sleep(0.5)
+                continue
+            except Exception as error:  # noqa: BLE001 - 反复失败就放弃
+                logger.warning(f"bili_whale: 注册私信巡查失败：{error}")
+                await asyncio.sleep(2.0)
+                continue
+            self._watch_schedule_id = schedule_id
+            logger.info(f"bili_whale: 私信巡查已注册（节拍 {interval}s）")
+            return
+
+        logger.warning("bili_whale: 等调度器就绪超时，私信巡查没注册")
+
+    async def _chat_watch_tick(self) -> None:
+        """调度器回调：交给巡查器判断这一拍要不要真查。"""
+
+        watcher = runtime.get_watcher()
+        if watcher is None:
+            return
+        try:
+            await watcher.tick()
+        except Exception as error:  # noqa: BLE001 - 巡查异常不打断调度
+            logger.warning(f"bili_whale: 私信巡查异常：{error}")
+
+    async def _stop_chat_watch(self) -> None:
+        """取消注册任务、移除调度、清掉巡查器。"""
+
+        task_id = self._watch_task_id
+        self._watch_task_id = None
+        if task_id:
+            try:
+                get_task_manager().cancel_task(task_id)
+            except Exception:  # noqa: BLE001 - 任务可能已结束
+                pass
+
+        schedule_id = self._watch_schedule_id
+        self._watch_schedule_id = None
+        try:
+            scheduler = get_unified_scheduler()
+        except Exception:  # noqa: BLE001 - 调度器没起来就不用清理
+            scheduler = None
+        if scheduler is not None:
+            found = None
+            try:
+                found = await scheduler.find_schedule_by_name(_WATCH_TASK_NAME)
+            except Exception:  # noqa: BLE001
+                found = None
+            for target in [item for item in (schedule_id, found) if item]:
+                try:
+                    await scheduler.remove_schedule(target)
+                except Exception:  # noqa: BLE001 - 卸载阶段尽力清理
+                    pass
+
+        runtime.set_watcher(None)
 
 
 __all__ = ["BiliWhalePlugin"]

@@ -36,6 +36,7 @@ MODULES = [
     "bili_whale.config",
     "bili_whale.client",
     "bili_whale.runtime",
+    "bili_whale.chat_watch",
     "bili_whale.tools",
     "bili_whale.plugin",
 ]
@@ -66,6 +67,7 @@ for name in MODULES:
 config_mod = importlib.import_module("bili_whale.config")
 client_mod = importlib.import_module("bili_whale.client")
 runtime_mod = importlib.import_module("bili_whale.runtime")
+watch_mod = importlib.import_module("bili_whale.chat_watch")
 tools_mod = importlib.import_module("bili_whale.tools")
 plugin_mod = importlib.import_module("bili_whale.plugin")
 
@@ -98,10 +100,19 @@ try:
     check("配置含 actions 节", hasattr(cfg, "actions"))
     check("配置含 query 节", hasattr(cfg, "query"))
     check("写操作默认开（这个是给主人自己号用的）", cfg.actions.enabled is True, str(cfg.actions.enabled))
+    check("关注 / 取关默认开（受总闸约束）", cfg.actions.allow_follow is True, str(cfg.actions.allow_follow))
     check("看视频默认开", cfg.watch.enabled is True, str(cfg.watch.enabled))
     check("帧数默认自动（0=按时长）", cfg.watch.frames == 0, str(cfg.watch.frames))
     check("cookie_file 默认为 data/bili_cookies.json", cfg.plugin.cookie_file == "data/bili_cookies.json", cfg.plugin.cookie_file)
     check("默认检查 MCP", cfg.plugin.check_mcp is True)
+    # —— 私信自动巡查（默认关）——
+    check("配置含 chat 节", hasattr(cfg, "chat"))
+    check("自动查私信默认关", cfg.chat.enabled is False, str(cfg.chat.enabled))
+    check("默认 10 分钟查一次", cfg.chat.idle_interval == 600, str(cfg.chat.idle_interval))
+    check("收到新私信转 10 秒", cfg.chat.burst_interval == 10, str(cfg.chat.burst_interval))
+    check("高频持续 6 次", cfg.chat.burst_checks == 6, str(cfg.chat.burst_checks))
+    check("节拍默认 10 秒", cfg.chat.tick_seconds == 10.0, str(cfg.chat.tick_seconds))
+    check("缓存文件在 data 下", cfg.chat.feed_file.startswith("data/"), cfg.chat.feed_file)
 except Exception as exc:  # noqa: BLE001
     check("配置实例化", False, f"{type(exc).__name__}: {exc}")
 
@@ -134,8 +145,39 @@ try:
 
     ok, text = asyncio.run(tools_mod.BiliCatalogTool(_stub_plugin).execute())
     check("bili_catalog 可执行且返回非空", bool(ok) and len(text) > 200, f"{len(text)} 字")
+    check("目录含私信能力", "action=chat" in text and "私信" in text)
+    check("目录含关注能力", "follow" in text and "关注" in text)
 except Exception as exc:  # noqa: BLE001
     check("bili_catalog 执行", False, f"{type(exc).__name__}: {exc}")
+
+# 工具描述里必须写清「多个候选先问请求者」这条规矩
+try:
+    action_desc = tools_mod.BiliActionTool(_stub_plugin).description
+    query_desc = tools_mod.BiliQueryTool(_stub_plugin).description
+    check("bili_action 描述含 follow", "follow" in action_desc)
+    check("bili_action 描述要求多候选先问人", "请求者" in action_desc)
+    check("bili_query 描述含 chat / search_user", "chat" in query_desc and "search_user" in query_desc)
+    check("bili_query 描述也要求多候选先问人", "请求者" in query_desc)
+except Exception as exc:  # noqa: BLE001
+    check("工具描述检查", False, f"{type(exc).__name__}: {exc}")
+
+# 巡查器能构造（假 client，不联网）
+try:
+    class _FakeClient:
+        def chat_sessions(self, size: int = 20, page: int = 1) -> dict:
+            return {"会话": [], "总数": 0}
+
+        def chat_peer_names(self, uids: list[int]) -> dict:
+            return {}
+
+        def chat_messages(self, talker_id: int, size: int = 20) -> dict:
+            return {"消息": [], "条数": 0}
+
+    watcher = watch_mod.ChatWatcher(_FakeClient(), idle_interval=600, burst_interval=10, burst_checks=6)
+    state = watcher.state()
+    check("ChatWatcher 可构造且初始状态空闲", state["模式"] == "空闲" and state["间隔秒"] == 600, str(state))
+except Exception as exc:  # noqa: BLE001
+    check("ChatWatcher 构造", False, f"{type(exc).__name__}: {exc}")
 
 # ---------------------------------------------------------------- 5. 客户端与 MCP
 try:

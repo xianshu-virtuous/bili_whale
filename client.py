@@ -41,10 +41,63 @@ UA = (
 
 MAIN_REFERER = "https://www.bilibili.com/"
 MALL_REFERER = "https://mall.bilibili.com/"
+MESSAGE_REFERER = "https://message.bilibili.com/"
+SEARCH_REFERER = "https://search.bilibili.com/"
+SPACE_REFERER = "https://space.bilibili.com/"
+
+#: 关系状态码 → 中文（``x/relation`` 的 attribute）
+RELATION_NAMES = {0: "未关注", 1: "悄悄关注", 2: "已关注", 6: "互关", 128: "已拉黑"}
 
 
 class BiliError(Exception):
     """客户端层的显式错误（登录态缺失、网络失败、接口返回非 0）。"""
+
+
+def dm_text(content: str, msg_type: int) -> str:
+    """把私信 ``content``（JSON 字符串）转成给人看的一句话。
+
+    私信接口的 content 永远是一段 JSON 字符串，不同 ``msg_type`` 结构完全不同：
+
+    - ``1`` 文本 → ``{"content": "正文"}``
+    - ``2`` 图片 → ``{"url": "..."}``
+    - ``5`` 撤回 → 空对象
+    - ``10`` 卡片（系统通知 / 分享） → ``{"title": ..., "text": ..., "jump_text": ...}``
+    - ``7`` 分享 → ``{"title": ..., "desc": ..., "jump_url": ...}``
+
+    解析失败就原样截断——宁可给模型看一段短原文，也不要抛异常把整轮查询打断。
+    """
+
+    raw = (content or "").strip()
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw[:200]
+    if not isinstance(data, dict):
+        return str(data)[:200]
+
+    if msg_type == 1:
+        return str(data.get("content") or "")[:500]
+    if msg_type == 2:
+        url = str(data.get("url") or "")
+        return f"[图片] {url}".strip() if url else "[图片]"
+    if msg_type == 5:
+        return "[撤回了一条消息]"
+
+    pieces: list[str] = []
+    for key in ("title", "text"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            pieces.append(value.strip())
+    if pieces:
+        return " ".join(pieces)[:300]
+
+    for key in ("content", "desc", "summary", "jump_text"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:300]
+    return f"[消息类型 {msg_type}]"
 
 
 def load_cookies(path: str | Path) -> dict[str, str]:
@@ -185,6 +238,13 @@ class BiliClient:
     def post_signed(self, url: str, params: dict[str, Any], *, referer: str = MAIN_REFERER) -> dict[str, Any]:
         form = self._signed({**params, "csrf": self.csrf})
         return self.post(url, form, referer=referer)
+
+    def get_signed(self, url: str, params: dict[str, Any], *, referer: str = MAIN_REFERER) -> dict[str, Any]:
+        """带 wbi 签名的 GET（搜索用户、空间信息这类接口要 w_rid/wts）。"""
+
+        signed = self._signed(params)
+        separator = "&" if "?" in url else "?"
+        return self.get(f"{url}{separator}{urllib.parse.urlencode(signed)}", referer=referer)
 
     # ------------------------------------------------------------------- 读
 
@@ -381,6 +441,151 @@ class BiliClient:
             ],
         }
 
+    # --------------------------------------------------------------- 私信
+
+    def chat_sessions(self, size: int = 20, page: int = 1) -> dict[str, Any]:
+        """私信会话列表（最近的在前）。
+
+        注意两个坑：
+
+        - 普通用户会话的 ``last_msg.account_info`` 是空的，昵称要另外批量查
+          （:meth:`chat_peer_names`），别指望这里有名字；
+        - 系统通知会话的 ``system_msg_type`` 非 0（talker_id 是 8.4e14 那种大数），
+          它们不是「谁给你发私信」，巡查时要排除。
+        """
+
+        res = self.get(
+            "https://api.vc.bilibili.com/session_svr/v1/session_svr/get_sessions"
+            "?session_type=1&group_id=0&build=0&mobi_app=web&platform=web"
+            f"&web_location=333.1387&end_seqno=&pn={page}&ps={max(1, size)}",
+            referer=MESSAGE_REFERER,
+        )
+        if res.get("code") != 0:
+            raise BiliError(f"取私信会话失败：{res.get('message') or res.get('code')}")
+        raw = (res.get("data") or {}).get("session_list") or []
+        my_uid = int(self.uid or 0)
+        sessions: list[dict[str, Any]] = []
+        for item in raw:
+            last = item.get("last_msg") or {}
+            talker = int(item.get("talker_id") or 0)
+            sender = int(last.get("sender_uid") or 0)
+            account = last.get("account_info") or {}
+            msg_type = int(last.get("msg_type") or 0)
+            sessions.append({
+                "talker_id": talker,
+                "系统": bool(item.get("system_msg_type")) or talker <= 0,
+                "unread": int(item.get("unread_count") or 0),
+                "last_ts": int(last.get("timestamp") or item.get("session_ts") or 0),
+                "last_sender_uid": sender,
+                "我发的": sender == my_uid,
+                "昵称": str(account.get("name") or ""),
+                "消息类型": msg_type,
+                "摘要": dm_text(str(last.get("content") or ""), msg_type),
+            })
+        return {"会话": sessions, "总数": len(sessions)}
+
+    def chat_peer_names(self, uids: list[int]) -> dict[int, str]:
+        """批量查用户昵称（会话列表里没有名字，靠这个接口补）。"""
+
+        ids = [str(int(u)) for u in uids if int(u or 0) > 0]
+        if not ids:
+            return {}
+        res = self.get(
+            "https://api.vc.bilibili.com/account/v1/user/cards?uids=" + ",".join(ids),
+            referer=MESSAGE_REFERER,
+        )
+        if res.get("code") != 0:
+            return {}
+        data = res.get("data") or []
+        if not isinstance(data, list):
+            return {}
+        return {
+            int(card.get("mid")): str(card.get("name") or "")
+            for card in data
+            if isinstance(card, dict) and card.get("mid")
+        }
+
+    def chat_messages(self, talker_id: int, size: int = 20) -> dict[str, Any]:
+        """拉某个会话最近的消息（按时间正序返回）。"""
+
+        res = self.get(
+            "https://api.vc.bilibili.com/svr_sync/v1/svr_sync/fetch_session_msgs"
+            f"?session_type=1&talker_id={int(talker_id)}&session_id=0&size={max(1, size)}"
+            "&build=0&mobi_app=web&platform=web&web_location=333.1387",
+            referer=MESSAGE_REFERER,
+        )
+        if res.get("code") != 0:
+            raise BiliError(f"取私信内容失败：{res.get('message') or res.get('code')}")
+        raw = (res.get("data") or {}).get("messages") or []
+        my_uid = int(self.uid or 0)
+        messages: list[dict[str, Any]] = []
+        for msg in reversed(raw):  # 接口给的是新→旧，这里翻成正序方便阅读
+            sender = int(msg.get("sender_uid") or 0)
+            msg_type = int(msg.get("msg_type") or 0)
+            messages.append({
+                "时间": time.strftime(
+                    "%m-%d %H:%M", time.localtime(int(msg.get("timestamp") or 0))
+                ),
+                "时间戳": int(msg.get("timestamp") or 0),
+                "我": sender == my_uid,
+                "类型": msg_type,
+                "文本": dm_text(str(msg.get("content") or ""), msg_type),
+            })
+        return {"消息": messages, "条数": len(messages)}
+
+    # --------------------------------------------------------------- 用户
+
+    def search_users(self, keyword: str, page: int = 1, page_size: int = 20) -> dict[str, Any]:
+        """搜 UP 主 / 用户（返回候选列表，不替调用方做选择）。"""
+
+        res = self.get_signed(
+            "https://api.bilibili.com/x/web-interface/wbi/search/type",
+            {
+                "keyword": keyword,
+                "search_type": "bili_user",
+                "page": max(1, page),
+                "page_size": max(1, page_size),
+            },
+            referer=SEARCH_REFERER,
+        )
+        if res.get("code") != 0:
+            raise BiliError(f"搜索用户失败：{res.get('message') or res.get('code')}")
+        data = res.get("data") or {}
+        candidates: list[dict[str, Any]] = []
+        for row in data.get("result") or []:
+            verify = row.get("official_verify") or {}
+            candidates.append({
+                "mid": int(row.get("mid") or 0),
+                "昵称": str(row.get("uname") or ""),
+                "粉丝": int(row.get("fans") or 0),
+                "投稿": int(row.get("videos") or 0),
+                "等级": int(row.get("level") or 0),
+                "认证": str(verify.get("desc") or ""),
+                "签名": str(row.get("usign") or "")[:80],
+            })
+        return {
+            "关键词": keyword,
+            "总数": data.get("numResults"),
+            "候选": candidates,
+        }
+
+    def relation(self, mid: int) -> dict[str, Any]:
+        """查和某个用户的关系（是否已关注）。"""
+
+        res = self.get(
+            f"https://api.bilibili.com/x/relation?fid={int(mid)}", referer=SPACE_REFERER
+        )
+        if res.get("code") != 0:
+            raise BiliError(f"查关注状态失败：{res.get('message') or res.get('code')}")
+        data = res.get("data") or {}
+        attribute = data.get("attribute")
+        return {
+            "attribute": attribute,
+            "状态": RELATION_NAMES.get(attribute, f"未知({attribute})"),
+            "关注了": attribute in (2, 6),
+            "互关": attribute == 6,
+        }
+
     # ------------------------------------------------------------------- 写
 
     def reply(self, bvid: str, text: str) -> dict[str, Any]:
@@ -449,5 +654,37 @@ class BiliClient:
             raise BiliError(f"{'收藏' if add else '取消收藏'}失败：{res.get('message') or res.get('code')}")
         return {"动作": "收藏" if add else "取消收藏", "视频": info.get("标题")}
 
+    def follow(self, mid: int, on: bool = True) -> dict[str, Any]:
+        """关注 / 取关某个 UP 主。
 
-__all__ = ["BiliClient", "BiliError", "load_cookies", "MIXIN_TAB"]
+        接口不需要 wbi 签名，只要 csrf（来自 cookie 的 bili_jct）。
+
+        幂等处理：关注一个已经关注的人会返回 ``22014``（已经关注用户），
+        取关一个没关注的人同理——这两种都按「已经是目标状态」返回成功，
+        免得模型把「重复关注」当成错误去瞎重试。
+        """
+
+        if not self.csrf:
+            raise BiliError("登录态里没有 bili_jct（csrf），关注操作需要它——请重新导出一份 cookies")
+        res = self.post(
+            "https://api.bilibili.com/x/relation/modify",
+            {
+                "fid": int(mid),
+                "act": 1 if on else 2,
+                "re_src": 11,
+                "csrf": self.csrf,
+            },
+            referer=SPACE_REFERER,
+        )
+        code = res.get("code")
+        message = str(res.get("message") or "")
+        if code != 0:
+            already = on and code == 22014
+            not_followed = (not on) and ("未关注" in message or "没有关注" in message)
+            if already or not_followed:
+                return {"动作": "关注" if on else "取关", "已存在": True, "提示": message}
+            raise BiliError(f"{'关注' if on else '取关'}失败：{message or code}")
+        return {"动作": "关注" if on else "取关", "已存在": False, "提示": message}
+
+
+__all__ = ["BiliClient", "BiliError", "load_cookies", "dm_text", "MIXIN_TAB", "RELATION_NAMES"]
